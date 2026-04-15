@@ -159,7 +159,7 @@ class WanVideoChunkAssembler:
             "required": {
                 "session_id": ("STRING", {"default": "run01"}),
                 "fps": ("INT", {"default": 16, "min": 1, "max": 120}),
-                "output_path": ("STRING", {"default": "/workspace/output/final.mp4"}),
+                "filename_prefix": ("STRING", {"default": "video/vace"}),
                 "skip_overlap_frames": ("INT", {"default": 0, "min": 0, "max": 256}),
                 "overlap_trim_mode": (
                     ["leading_on_later", "trailing_on_earlier", "none"],
@@ -187,7 +187,7 @@ class WanVideoChunkAssembler:
         self,
         session_id,
         fps,
-        output_path,
+        filename_prefix,
         skip_overlap_frames,
         crf,
         delete_chunks_after,
@@ -233,7 +233,25 @@ class WanVideoChunkAssembler:
         if total == 0:
             raise RuntimeError("No frames after trimming")
 
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        # Resolve output via ComfyUI's standard helper so behavior matches
+        # SaveImage / VHS_VideoCombine: prefix becomes a path under output dir,
+        # with auto-incrementing 5-digit counter.
+        try:
+            full_output_folder, filename, counter, subfolder, _ = (
+                folder_paths.get_save_image_path(filename_prefix, _COMFY_OUTPUT)
+            )
+        except Exception:
+            # Fallback if folder_paths isn't importable
+            full_output_folder = os.path.join(_COMFY_OUTPUT, os.path.dirname(filename_prefix))
+            os.makedirs(full_output_folder, exist_ok=True)
+            filename = os.path.basename(filename_prefix) or "video"
+            existing = [f for f in os.listdir(full_output_folder) if f.startswith(filename + "_")]
+            counter = len(existing) + 1
+            subfolder = os.path.dirname(filename_prefix)
+
+        out_filename = f"{filename}_{counter:05d}.mp4"
+        output_path = os.path.join(full_output_folder, out_filename)
+        os.makedirs(full_output_folder, exist_ok=True)
 
         # Optional: dump AUDIO dict to a temp wav for muxing
         audio_path = None
@@ -304,36 +322,15 @@ class WanVideoChunkAssembler:
             shutil.rmtree(session_dir)
             print(f"[ChunkAssembler] deleted {session_dir}")
 
-        # Place a real-file copy inside ComfyUI's output dir so /view can serve it.
-        # Symlinks are often blocked by ComfyUI's safe-path check.
-        preview_name = f"{session_id}_{os.path.basename(output_path)}"
-        preview_subfolder = "wan_chunk_io"
-        preview_dir = os.path.join(_COMFY_OUTPUT, preview_subfolder)
-        os.makedirs(preview_dir, exist_ok=True)
-        preview_path = os.path.join(preview_dir, preview_name)
-        preview_ok = False
-        try:
-            if os.path.abspath(output_path) == os.path.abspath(preview_path):
-                preview_ok = True
-            else:
-                if os.path.lexists(preview_path):
-                    os.remove(preview_path)
-                shutil.copy2(output_path, preview_path)
-                preview_ok = True
-        except Exception as e:
-            print(f"[ChunkAssembler] preview copy failed: {e}")
-
-        ui = {}
-        if preview_ok:
-            ui = {"gifs": [{
-                "filename": preview_name,
-                "subfolder": preview_subfolder,
-                "type": "output",
-                "format": "video/mp4",
-                "frame_rate": float(fps),
-                "fullpath": preview_path,
-            }]}
-            print(f"[ChunkAssembler] preview at {preview_path}")
+        ui = {"gifs": [{
+            "filename": out_filename,
+            "subfolder": subfolder,
+            "type": "output",
+            "format": "video/mp4",
+            "frame_rate": float(fps),
+            "fullpath": output_path,
+        }]}
+        print(f"[ChunkAssembler] preview at {output_path}")
 
         return {"ui": ui, "result": (output_path,)}
 
