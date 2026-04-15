@@ -158,7 +158,7 @@ class WanVideoChunkAssembler:
         return {
             "required": {
                 "session_id": ("STRING", {"default": "run01"}),
-                "fps": ("INT", {"default": 16, "min": 1, "max": 120}),
+                "fps": ("FLOAT", {"default": 16.0, "min": 0.1, "max": 240.0, "step": 0.01}),
                 "filename_prefix": ("STRING", {"default": "video/vace"}),
                 "skip_overlap_frames": ("INT", {"default": 0, "min": 0, "max": 256}),
                 "overlap_trim_mode": (
