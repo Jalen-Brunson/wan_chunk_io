@@ -196,6 +196,15 @@ class WanVideoChunkAssembler:
         audio_offset_sec=0.0,
         seam_mode="blend",
     ):
+        # Tolerate empty-string / stale widget values from older workflow JSONs
+        try:
+            audio_offset_sec = float(audio_offset_sec) if audio_offset_sec != "" else 0.0
+        except (TypeError, ValueError):
+            audio_offset_sec = 0.0
+        try:
+            fps = float(fps) if fps != "" else 16.0
+        except (TypeError, ValueError):
+            fps = 16.0
         session_dir = os.path.join(TEMP_ROOT, session_id)
         if not os.path.isdir(session_dir):
             raise RuntimeError(f"No session dir: {session_dir}")
