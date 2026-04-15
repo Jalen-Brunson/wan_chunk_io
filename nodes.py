@@ -453,6 +453,133 @@ class WanVideoChunkSessionReset:
         return (session_id,)
 
 
+class WanVideoChunkCount:
+    """
+    Returns the number of chunks in a session. Use as the loop-count input
+    for whatever iterator node you're driving post-processing with.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"session_id": ("STRING", {"default": "run01"})}}
+
+    RETURN_TYPES = ("INT",)
+    RETURN_NAMES = ("chunk_count",)
+    FUNCTION = "count"
+    CATEGORY = "WanChunkIO"
+
+    @classmethod
+    def IS_CHANGED(cls, session_id):
+        return float("nan")
+
+    def count(self, session_id):
+        p = os.path.join(TEMP_ROOT, session_id)
+        if not os.path.isdir(p):
+            return (0,)
+        n = sum(
+            1 for d in os.listdir(p)
+            if d.startswith("chunk_") and os.path.isdir(os.path.join(p, d))
+        )
+        print(f"[ChunkCount] session={session_id} has {n} chunks")
+        return (n,)
+
+
+class WanVideoChunkLoader:
+    """
+    Loads one chunk's PNG sequence from disk back into an IMAGE batch,
+    for post-processing (upscale / interpolate / etc.) before assembly.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "session_id": ("STRING", {"default": "run01"}),
+                "chunk_index": ("INT", {"default": 0, "min": 0, "max": 9999}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "INT", "INT")
+    RETURN_NAMES = ("images", "frame_count", "chunk_count_in_session")
+    FUNCTION = "load"
+    CATEGORY = "WanChunkIO"
+
+    @classmethod
+    def IS_CHANGED(cls, session_id, chunk_index):
+        p = os.path.join(TEMP_ROOT, session_id, f"chunk_{chunk_index:04d}")
+        if not os.path.isdir(p):
+            return float("nan")
+        mt = max((os.path.getmtime(os.path.join(p, f)) for f in os.listdir(p)), default=0)
+        return f"{p}:{mt}"
+
+    def load(self, session_id, chunk_index):
+        session_dir = os.path.join(TEMP_ROOT, session_id)
+        chunk_dir = os.path.join(session_dir, f"chunk_{chunk_index:04d}")
+        if not os.path.isdir(chunk_dir):
+            raise RuntimeError(f"Chunk dir missing: {chunk_dir}")
+
+        files = sorted(f for f in os.listdir(chunk_dir) if f.endswith(".png"))
+        if not files:
+            raise RuntimeError(f"No PNGs in {chunk_dir}")
+
+        frames = []
+        for f in files:
+            arr = np.asarray(Image.open(os.path.join(chunk_dir, f)).convert("RGB"),
+                             dtype=np.float32) / 255.0
+            frames.append(torch.from_numpy(arr))
+        images = torch.stack(frames, dim=0)  # [N, H, W, 3]
+
+        all_chunks = sum(
+            1 for d in os.listdir(session_dir)
+            if d.startswith("chunk_") and os.path.isdir(os.path.join(session_dir, d))
+        )
+        print(f"[ChunkLoader] {session_id}/chunk_{chunk_index:04d}: {len(files)} frames")
+        return (images, len(files), all_chunks)
+
+
+class WanVideoChunkSaveAs:
+    """
+    Writes an IMAGE batch as a chunk under a DIFFERENT session id,
+    so post-processed chunks don't overwrite the originals.
+    Use this after upscaling/interpolating to stage the assembler input.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "target_session_id": ("STRING", {"default": "run01_hi"}),
+                "chunk_index": ("INT", {"default": 0, "min": 0, "max": 9999}),
+                "purge_ram": ("BOOLEAN", {"default": True}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "INT")
+    RETURN_NAMES = ("target_session_id", "next_chunk_index")
+    FUNCTION = "save"
+    CATEGORY = "WanChunkIO"
+    OUTPUT_NODE = True
+
+    def save(self, images, target_session_id, chunk_index, purge_ram):
+        before = _ram_str()
+        out_dir = os.path.join(TEMP_ROOT, target_session_id, f"chunk_{chunk_index:04d}")
+        os.makedirs(out_dir, exist_ok=True)
+        n, h, w, _ = images.shape
+        imgs_cpu = images.detach().cpu()
+        for i in range(n):
+            frame = imgs_cpu[i].clamp(0, 1).mul(255).to(torch.uint8).numpy()
+            Image.fromarray(frame).save(
+                os.path.join(out_dir, f"{i:06d}.png"), compress_level=1
+            )
+        del images, imgs_cpu
+        if purge_ram:
+            _purge(trim_ram=True)
+        print(f"[ChunkSaveAs] wrote {n} frames {w}x{h} -> {out_dir}\n"
+              f"  before: {before}\n  after:  {_ram_str()}")
+        return (target_session_id, chunk_index + 1)
+
+
 class WanMemoryPurge:
     """
     Hammer node: runs gc.collect(), torch.cuda.empty_cache(), malloc_trim(0),
@@ -504,6 +631,9 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoChunkSessionReset": WanVideoChunkSessionReset,
     "WanVideoChunkSessionAuto": WanVideoChunkSessionAuto,
     "WanMemoryPurge": WanMemoryPurge,
+    "WanVideoChunkLoader": WanVideoChunkLoader,
+    "WanVideoChunkSaveAs": WanVideoChunkSaveAs,
+    "WanVideoChunkCount": WanVideoChunkCount,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -512,4 +642,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoChunkSessionReset": "Wan Video Chunk Session Reset",
     "WanVideoChunkSessionAuto": "Wan Video Chunk Session Auto-Increment",
     "WanMemoryPurge": "Wan Memory Purge (gc + malloc_trim)",
+    "WanVideoChunkLoader": "Wan Video Chunk Loader (disk -> IMAGE)",
+    "WanVideoChunkSaveAs": "Wan Video Chunk Save-As (new session)",
+    "WanVideoChunkCount": "Wan Video Chunk Count (session -> INT)",
 }
