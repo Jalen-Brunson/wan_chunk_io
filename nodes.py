@@ -453,11 +453,57 @@ class WanVideoChunkSessionReset:
         return (session_id,)
 
 
+class WanMemoryPurge:
+    """
+    Hammer node: runs gc.collect(), torch.cuda.empty_cache(), malloc_trim(0),
+    and optionally soft-unloads ComfyUI's currently-tracked models.
+    Place inside your loop to fight allocator fragmentation and glibc heap retention.
+    Has a passthrough IMAGE/INT so it can sit inline in the graph.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "trigger": ("INT", {"default": 0, "forceInput": True}),
+                "unload_models": ("BOOLEAN", {"default": False, "tooltip": "Offload ComfyUI-tracked models from VRAM. Usually leave OFF — helps VRAM, hurts RAM."}),
+                "aggressive": ("BOOLEAN", {"default": True, "tooltip": "Double-pass gc + malloc_trim"}),
+            }
+        }
+
+    RETURN_TYPES = ("INT",)
+    RETURN_NAMES = ("trigger_passthrough",)
+    FUNCTION = "purge"
+    CATEGORY = "WanChunkIO"
+    OUTPUT_NODE = True
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("nan")
+
+    def purge(self, trigger, unload_models, aggressive):
+        before = _ram_str()
+        if unload_models:
+            try:
+                import comfy.model_management as mm
+                mm.unload_all_models()
+                mm.soft_empty_cache()
+            except Exception as e:
+                print(f"[MemoryPurge] model unload skipped: {e}")
+        _purge(trim_ram=True)
+        if aggressive:
+            _purge(trim_ram=True)
+        after = _ram_str()
+        print(f"[MemoryPurge] before: {before}\n           after:  {after}")
+        return (trigger,)
+
+
 NODE_CLASS_MAPPINGS = {
     "WanVideoChunkWriter": WanVideoChunkWriter,
     "WanVideoChunkAssembler": WanVideoChunkAssembler,
     "WanVideoChunkSessionReset": WanVideoChunkSessionReset,
     "WanVideoChunkSessionAuto": WanVideoChunkSessionAuto,
+    "WanMemoryPurge": WanMemoryPurge,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -465,4 +511,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoChunkAssembler": "Wan Video Chunk Assembler (ffmpeg)",
     "WanVideoChunkSessionReset": "Wan Video Chunk Session Reset",
     "WanVideoChunkSessionAuto": "Wan Video Chunk Session Auto-Increment",
+    "WanMemoryPurge": "Wan Memory Purge (gc + malloc_trim)",
 }
