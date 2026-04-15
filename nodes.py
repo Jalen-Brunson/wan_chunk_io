@@ -160,10 +160,10 @@ class WanVideoChunkAssembler:
                 "session_id": ("STRING", {"default": "run01"}),
                 "fps": ("FLOAT", {"default": 16.0, "min": 0.1, "max": 240.0, "step": 0.01}),
                 "filename_prefix": ("STRING", {"default": "video/vace"}),
-                "skip_overlap_frames": ("INT", {"default": 0, "min": 0, "max": 256}),
-                "overlap_trim_mode": (
-                    ["leading_on_later", "trailing_on_earlier", "none"],
-                    {"default": "leading_on_later"},
+                "overlap_frames": ("INT", {"default": 17, "min": 0, "max": 256, "tooltip": "Number of overlap frames between consecutive chunks. Must match what your loop generated. For WAN VAE, use 4N+1 (5, 9, 13, 17, 21...)."}),
+                "seam_mode": (
+                    ["blend", "hard_cut_keep_earlier", "hard_cut_keep_later", "none"],
+                    {"default": "blend", "tooltip": "blend = linear crossfade across overlap region (recommended). hard_cut_* = pick one chunk's frames at the seam. none = concatenate raw, overlap appears duplicated."},
                 ),
                 "crf": ("INT", {"default": 17, "min": 0, "max": 51}),
                 "delete_chunks_after": ("BOOLEAN", {"default": False}),
@@ -188,13 +188,13 @@ class WanVideoChunkAssembler:
         session_id,
         fps,
         filename_prefix,
-        skip_overlap_frames,
+        overlap_frames,
         crf,
         delete_chunks_after,
         wait_for=None,
         audio=None,
         audio_offset_sec=0.0,
-        overlap_trim_mode="leading_on_later",
+        seam_mode="blend",
     ):
         session_dir = os.path.join(TEMP_ROOT, session_id)
         if not os.path.isdir(session_dir):
@@ -207,31 +207,74 @@ class WanVideoChunkAssembler:
         if not chunk_dirs:
             raise RuntimeError(f"No chunks in {session_dir}")
 
-        # Build a flat symlink dir with sequential numbering so we can use
-        # the bulletproof image2 demuxer instead of the fiddly concat demuxer.
+        # Build a flat dir of sequentially-numbered PNGs (symlinks for raw frames,
+        # real files for blended seam frames) and feed it to ffmpeg image2.
         flat_dir = os.path.join(session_dir, "_flat")
-        if os.path.isdir(flat_dir):
-            shutil.rmtree(flat_dir)
-        os.makedirs(flat_dir)
+        blend_dir = os.path.join(session_dir, "_blend")
+        for d in (flat_dir, blend_dir):
+            if os.path.isdir(d):
+                shutil.rmtree(d)
+            os.makedirs(d)
+
+        # Cache each chunk's sorted file list once.
+        chunk_paths = [os.path.join(session_dir, cd) for cd in chunk_dirs]
+        chunk_files = [
+            sorted(f for f in os.listdir(p) if f.endswith(".png"))
+            for p in chunk_paths
+        ]
+        last_idx = len(chunk_dirs) - 1
+
+        def _link(src, total):
+            os.symlink(src, os.path.join(flat_dir, f"{total:08d}.png"))
+
+        def _blend_pair(a_path, b_path, alpha, out_path):
+            a = np.asarray(Image.open(a_path), dtype=np.float32)
+            b = np.asarray(Image.open(b_path), dtype=np.float32)
+            out = (1.0 - alpha) * a + alpha * b
+            Image.fromarray(np.clip(out, 0, 255).astype(np.uint8)).save(
+                out_path, compress_level=1
+            )
 
         total = 0
-        last_idx = len(chunk_dirs) - 1
-        for idx, cd in enumerate(chunk_dirs):
-            cd_path = os.path.join(session_dir, cd)
-            frames = sorted(f for f in os.listdir(cd_path) if f.endswith(".png"))
-            if skip_overlap_frames > 0 and overlap_trim_mode != "none":
-                if overlap_trim_mode == "leading_on_later" and idx > 0:
-                    frames = frames[skip_overlap_frames:]
-                elif overlap_trim_mode == "trailing_on_earlier" and idx < last_idx:
-                    frames = frames[: len(frames) - skip_overlap_frames]
-            for f in frames:
-                src = os.path.join(cd_path, f)
-                dst = os.path.join(flat_dir, f"{total:08d}.png")
-                os.symlink(src, dst)
+        ov = overlap_frames if seam_mode != "none" else 0
+
+        for i, files in enumerate(chunk_files):
+            cd_path = chunk_paths[i]
+            n = len(files)
+
+            if seam_mode == "blend" and ov > 0 and i > 0:
+                # write blended seam between prev chunk's tail and this chunk's head
+                prev_path = chunk_paths[i - 1]
+                prev_files = chunk_files[i - 1]
+                for j in range(ov):
+                    alpha = (j + 1) / (ov + 1) if ov > 1 else 0.5
+                    a = os.path.join(prev_path, prev_files[-ov + j])
+                    b = os.path.join(cd_path, files[j])
+                    out = os.path.join(blend_dir, f"seam_{i:04d}_{j:04d}.png")
+                    _blend_pair(a, b, alpha, out)
+                    _link(out, total)
+                    total += 1
+
+            # decide which slice of this chunk's raw frames to emit
+            if seam_mode == "blend":
+                start = ov if i > 0 else 0
+                end = n - ov if i < last_idx else n
+            elif seam_mode == "hard_cut_keep_earlier":
+                start = 0
+                end = n - ov if i < last_idx else n
+            elif seam_mode == "hard_cut_keep_later":
+                start = ov if i > 0 else 0
+                end = n
+            else:  # none
+                start, end = 0, n
+
+            for j in range(start, end):
+                _link(os.path.join(cd_path, files[j]), total)
                 total += 1
 
         if total == 0:
-            raise RuntimeError("No frames after trimming")
+            raise RuntimeError("No frames after seam processing")
+        print(f"[ChunkAssembler] seam_mode={seam_mode} overlap={ov} -> {total} frames")
 
         # Resolve output via ComfyUI's standard helper so behavior matches
         # SaveImage / VHS_VideoCombine: prefix becomes a path under output dir,
