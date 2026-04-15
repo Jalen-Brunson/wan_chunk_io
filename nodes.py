@@ -304,31 +304,36 @@ class WanVideoChunkAssembler:
             shutil.rmtree(session_dir)
             print(f"[ChunkAssembler] deleted {session_dir}")
 
-        # Make a copy/symlink in ComfyUI's output dir so the web UI can preview it
+        # Place a real-file copy inside ComfyUI's output dir so /view can serve it.
+        # Symlinks are often blocked by ComfyUI's safe-path check.
         preview_name = f"{session_id}_{os.path.basename(output_path)}"
-        preview_path = os.path.join(_COMFY_OUTPUT, preview_name)
+        preview_subfolder = "wan_chunk_io"
+        preview_dir = os.path.join(_COMFY_OUTPUT, preview_subfolder)
+        os.makedirs(preview_dir, exist_ok=True)
+        preview_path = os.path.join(preview_dir, preview_name)
+        preview_ok = False
         try:
-            if os.path.abspath(output_path) != os.path.abspath(preview_path):
+            if os.path.abspath(output_path) == os.path.abspath(preview_path):
+                preview_ok = True
+            else:
                 if os.path.lexists(preview_path):
                     os.remove(preview_path)
-                # symlink keeps it cheap; if filesystem doesn't allow, fall back to copy
-                try:
-                    os.symlink(os.path.abspath(output_path), preview_path)
-                except OSError:
-                    shutil.copy2(output_path, preview_path)
+                shutil.copy2(output_path, preview_path)
+                preview_ok = True
         except Exception as e:
-            print(f"[ChunkAssembler] preview link failed: {e}")
-            preview_name = None
+            print(f"[ChunkAssembler] preview copy failed: {e}")
 
         ui = {}
-        if preview_name is not None:
+        if preview_ok:
             ui = {"gifs": [{
                 "filename": preview_name,
-                "subfolder": "",
+                "subfolder": preview_subfolder,
                 "type": "output",
                 "format": "video/mp4",
-                "frame_rate": fps,
+                "frame_rate": float(fps),
+                "fullpath": preview_path,
             }]}
+            print(f"[ChunkAssembler] preview at {preview_path}")
 
         return {"ui": ui, "result": (output_path,)}
 
