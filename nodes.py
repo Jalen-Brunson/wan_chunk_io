@@ -16,8 +16,15 @@ except Exception:
 
 
 TEMP_ROOT = "/workspace/temp_chunks"
-CGROUP_USAGE = "/sys/fs/cgroup/memory/memory.usage_in_bytes"
-CGROUP_LIMIT = "/sys/fs/cgroup/memory/memory.limit_in_bytes"
+# cgroup v2 first, v1 fallback
+_CGROUP_V2_USAGE = "/sys/fs/cgroup/memory.current"
+_CGROUP_V2_LIMIT = "/sys/fs/cgroup/memory.max"
+_CGROUP_V1_USAGE = "/sys/fs/cgroup/memory/memory.usage_in_bytes"
+_CGROUP_V1_LIMIT = "/sys/fs/cgroup/memory/memory.limit_in_bytes"
+if os.path.exists(_CGROUP_V2_USAGE):
+    CGROUP_USAGE, CGROUP_LIMIT = _CGROUP_V2_USAGE, _CGROUP_V2_LIMIT
+else:
+    CGROUP_USAGE, CGROUP_LIMIT = _CGROUP_V1_USAGE, _CGROUP_V1_LIMIT
 
 # glibc malloc_trim — returns freed heap pages to the OS so RSS actually drops.
 # Python's allocator retains arenas after del/gc; without this, top/nvidia-smi
@@ -33,7 +40,10 @@ except Exception:
 def _read_cgroup(path):
     try:
         with open(path) as f:
-            return int(f.read().strip())
+            v = f.read().strip()
+        if v == "max":  # cgroup v2 "unlimited"
+            return None
+        return int(v)
     except Exception:
         return None
 
@@ -183,6 +193,11 @@ class WanVideoChunkAssembler:
     CATEGORY = "WanChunkIO"
     OUTPUT_NODE = True
 
+    @classmethod
+    def VALIDATE_INPUTS(cls, audio_offset_sec=0.0, fps=16.0, **kwargs):
+        # Allow null/empty/stale widget values; assemble() coerces to defaults.
+        return True
+
     def assemble(
         self,
         session_id,
@@ -289,17 +304,27 @@ class WanVideoChunkAssembler:
         # SaveImage / VHS_VideoCombine: prefix becomes a path under output dir,
         # with auto-incrementing 5-digit counter.
         try:
-            full_output_folder, filename, counter, subfolder, _ = (
+            full_output_folder, filename, _counter_unused, subfolder, _ = (
                 folder_paths.get_save_image_path(filename_prefix, _COMFY_OUTPUT)
             )
         except Exception:
             # Fallback if folder_paths isn't importable
             full_output_folder = os.path.join(_COMFY_OUTPUT, os.path.dirname(filename_prefix))
-            os.makedirs(full_output_folder, exist_ok=True)
             filename = os.path.basename(filename_prefix) or "video"
-            existing = [f for f in os.listdir(full_output_folder) if f.startswith(filename + "_")]
-            counter = len(existing) + 1
             subfolder = os.path.dirname(filename_prefix)
+        os.makedirs(full_output_folder, exist_ok=True)
+
+        # get_save_image_path's counter is based on an IMAGE pattern
+        # (foo_00001_.png with trailing underscore) and returns 1 for .mp4
+        # outputs — always overwriting. Scan existing mp4s matching our
+        # pattern and take max+1 instead.
+        mp4_re = re.compile(rf"^{re.escape(filename)}_(\d+)\.mp4$")
+        existing_nums = [
+            int(m.group(1))
+            for f in os.listdir(full_output_folder)
+            if (m := mp4_re.match(f))
+        ]
+        counter = (max(existing_nums) + 1) if existing_nums else 1
 
         out_filename = f"{filename}_{counter:05d}.mp4"
         output_path = os.path.join(full_output_folder, out_filename)
@@ -625,6 +650,289 @@ class WanMemoryPurge:
         return (trigger,)
 
 
+_LEAK_PREV_BY_LABEL = {}
+
+
+class _AnyType(str):
+    def __ne__(self, other):
+        return False
+
+
+_ANY = _AnyType("*")
+
+
+class WanTensorLeakProbe:
+    """
+    Enumerates all live torch.Tensor objects and prints top-N by memory,
+    plus growth delta from the previous call with the same label. Insert in
+    a loop body wired to any upstream output (IMAGE / INT / LATENT / etc.)
+    via `trigger` to force execution order; passes the value through.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "label": ("STRING", {"default": "probe"}),
+                "trigger": (_ANY, {"forceInput": True}),
+                "top_n": ("INT", {"default": 15, "min": 1, "max": 100}),
+                "show_referrers": ("BOOLEAN", {"default": False, "tooltip": "For the single largest tensor, walk gc referrers to find what holds it."}),
+            }
+        }
+
+    RETURN_TYPES = (_ANY,)
+    RETURN_NAMES = ("passthrough",)
+    FUNCTION = "probe"
+    CATEGORY = "WanChunkIO"
+    OUTPUT_NODE = True
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("nan")
+
+    def probe(self, label, trigger, top_n, show_referrers):
+        gc.collect()
+        tensors = []
+        for obj in gc.get_objects():
+            try:
+                if isinstance(obj, torch.Tensor):
+                    nbytes = obj.element_size() * obj.nelement()
+                    if nbytes == 0:
+                        continue
+                    tensors.append((nbytes, tuple(obj.shape), str(obj.dtype), str(obj.device), id(obj)))
+            except Exception:
+                continue
+
+        groups = {}
+        for nbytes, shape, dtype, device, _id in tensors:
+            key = (shape, dtype, device)
+            if key not in groups:
+                groups[key] = [0, 0]
+            groups[key][0] += 1
+            groups[key][1] += nbytes
+
+        total_bytes = sum(v[1] for v in groups.values())
+        total_count = sum(v[0] for v in groups.values())
+
+        print(f"\n=== [LeakProbe:{label}] live tensors={total_count}  total={total_bytes/1e9:.2f} GB ===")
+        print(f"{'cnt':>5} {'GB':>8}  shape                              dtype              device")
+        sorted_groups = sorted(groups.items(), key=lambda x: -x[1][1])
+        for (shape, dtype, device), (c, nb) in sorted_groups[:top_n]:
+            print(f"{c:>5} {nb/1e9:>8.3f}  {str(shape):<34} {dtype:<18} {device}")
+
+        prev = _LEAK_PREV_BY_LABEL.get(label)
+        if prev:
+            prev_groups, prev_total = prev
+            print(f"--- Δ vs last [{label}]  totalΔ={((total_bytes-prev_total)/1e9):+.2f} GB  countΔ={total_count - sum(v[0] for v in prev_groups.values()):+d}")
+            diffs = []
+            all_keys = set(groups) | set(prev_groups)
+            for key in all_keys:
+                c1, b1 = groups.get(key, (0, 0))
+                c0, b0 = prev_groups.get(key, (0, 0))
+                if c1 != c0 or b1 != b0:
+                    diffs.append((b1 - b0, c1 - c0, key))
+            diffs.sort(key=lambda x: -abs(x[0]))
+            for delta_b, delta_c, (shape, dtype, device) in diffs[:top_n]:
+                if delta_b == 0 and delta_c == 0:
+                    continue
+                print(f"  Δcnt={delta_c:+5d}  ΔGB={delta_b/1e9:+8.3f}  {str(shape):<34} {dtype:<18} {device}")
+
+        _LEAK_PREV_BY_LABEL[label] = ({k: tuple(v) for k, v in groups.items()}, total_bytes)
+
+        if show_referrers and tensors:
+            tensors.sort(key=lambda x: -x[0])
+            biggest_id = tensors[0][4]
+            target = None
+            for obj in gc.get_objects():
+                try:
+                    if id(obj) == biggest_id:
+                        target = obj
+                        break
+                except Exception:
+                    continue
+            if target is not None:
+                print(f"--- referrers of biggest tensor shape={tuple(target.shape)} dtype={target.dtype} ---")
+                refs = gc.get_referrers(target)
+                for i, r in enumerate(refs[:10]):
+                    try:
+                        rtype = type(r).__name__
+                        rsize = len(r) if hasattr(r, "__len__") else "-"
+                        preview = str(r)[:120].replace("\n", " ")
+                        print(f"  [{i}] {rtype}(len={rsize}): {preview}")
+                    except Exception as e:
+                        print(f"  [{i}] <repr-fail: {e}>")
+
+        return (trigger,)
+
+
+_OBJ_PREV_BY_LABEL = {}
+
+
+def _size_of(obj):
+    """Estimate byte size for common large-object types. Returns 0 if unknown/small."""
+    try:
+        import numpy as _np
+    except Exception:
+        _np = None
+    try:
+        from PIL import Image as _PILImage
+    except Exception:
+        _PILImage = None
+
+    t = type(obj)
+    tn = t.__name__
+    # torch.Tensor handled separately by the tensor probe
+    if isinstance(obj, torch.Tensor):
+        return 0
+    if _np is not None and isinstance(obj, _np.ndarray):
+        return obj.nbytes
+    if _PILImage is not None and isinstance(obj, _PILImage.Image):
+        try:
+            w, h = obj.size
+            m = obj.mode
+            bpp = {"1": 1, "L": 1, "P": 1, "RGB": 3, "RGBA": 4, "CMYK": 4, "YCbCr": 3, "I": 4, "F": 4}.get(m, 4)
+            return w * h * bpp
+        except Exception:
+            return 0
+    if isinstance(obj, (bytes, bytearray)):
+        return len(obj)
+    if isinstance(obj, memoryview):
+        try:
+            return obj.nbytes
+        except Exception:
+            return 0
+    # large str/list/tuple/dict — count only if big
+    if isinstance(obj, str):
+        n = len(obj)
+        return n if n > 1_000_000 else 0
+    if isinstance(obj, (list, tuple)):
+        n = len(obj)
+        return (n * 8) if n > 100_000 else 0  # rough pointer cost only
+    if isinstance(obj, dict):
+        n = len(obj)
+        return (n * 16) if n > 100_000 else 0
+    return 0
+
+
+class WanObjectLeakProbe:
+    """
+    Scans all live Python objects (non-tensor) for large allocations:
+    numpy arrays, PIL images, bytes/bytearray, memoryview, plus unusually
+    large str/list/tuple/dict. Prints top-N and growth deltas.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "label": ("STRING", {"default": "obj"}),
+                "trigger": (_ANY, {"forceInput": True}),
+                "top_n": ("INT", {"default": 20, "min": 1, "max": 200}),
+                "min_mb": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10240.0, "step": 0.1, "tooltip": "Only report individual objects ≥ this size (MB)."}),
+                "show_referrers_biggest": ("BOOLEAN", {"default": False}),
+            }
+        }
+
+    RETURN_TYPES = (_ANY,)
+    RETURN_NAMES = ("passthrough",)
+    FUNCTION = "probe"
+    CATEGORY = "WanChunkIO"
+    OUTPUT_NODE = True
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("nan")
+
+    def probe(self, label, trigger, top_n, min_mb, show_referrers_biggest):
+        gc.collect()
+        min_bytes = int(min_mb * 1024 * 1024)
+
+        # Per-type aggregate
+        by_type_count = {}
+        by_type_bytes = {}
+        # Big individual items (for referrer hunt)
+        big_items = []  # (nbytes, type_name, detail, id)
+
+        for obj in gc.get_objects():
+            try:
+                nbytes = _size_of(obj)
+                if nbytes == 0:
+                    continue
+                tn = type(obj).__name__
+                by_type_count[tn] = by_type_count.get(tn, 0) + 1
+                by_type_bytes[tn] = by_type_bytes.get(tn, 0) + nbytes
+                if nbytes >= min_bytes:
+                    try:
+                        import numpy as _np
+                        if isinstance(obj, _np.ndarray):
+                            detail = f"shape={obj.shape} dtype={obj.dtype}"
+                        elif hasattr(obj, "size") and hasattr(obj, "mode"):
+                            detail = f"{obj.size} mode={obj.mode}"
+                        elif isinstance(obj, (bytes, bytearray, memoryview)):
+                            detail = f"len={nbytes}"
+                        else:
+                            detail = f"len={len(obj) if hasattr(obj, '__len__') else '-'}"
+                    except Exception:
+                        detail = "-"
+                    big_items.append((nbytes, tn, detail, id(obj)))
+            except Exception:
+                continue
+
+        total_bytes = sum(by_type_bytes.values())
+        print(f"\n=== [ObjLeakProbe:{label}] non-tensor objects total={total_bytes/1e9:.3f} GB types={len(by_type_count)} ===")
+        print(f"{'type':<20} {'count':>9} {'GB':>10}")
+        for tn, nb in sorted(by_type_bytes.items(), key=lambda x: -x[1])[:top_n]:
+            print(f"{tn:<20} {by_type_count[tn]:>9} {nb/1e9:>10.3f}")
+
+        big_items.sort(key=lambda x: -x[0])
+        if big_items:
+            print(f"--- individual objects ≥ {min_mb} MB (top {top_n}) ---")
+            for nbytes, tn, detail, _id in big_items[:top_n]:
+                print(f"  {nbytes/1e9:>7.3f} GB  {tn:<20} {detail}")
+
+        prev = _OBJ_PREV_BY_LABEL.get(label)
+        if prev:
+            prev_counts, prev_bytes, prev_total = prev
+            print(f"--- Δ vs last [{label}]  totalΔ={((total_bytes-prev_total)/1e9):+.3f} GB")
+            all_tn = set(by_type_bytes) | set(prev_bytes)
+            diffs = []
+            for tn in all_tn:
+                b1 = by_type_bytes.get(tn, 0); b0 = prev_bytes.get(tn, 0)
+                c1 = by_type_count.get(tn, 0); c0 = prev_counts.get(tn, 0)
+                if b1 != b0 or c1 != c0:
+                    diffs.append((b1 - b0, c1 - c0, tn))
+            diffs.sort(key=lambda x: -abs(x[0]))
+            for delta_b, delta_c, tn in diffs[:top_n]:
+                if delta_b == 0 and delta_c == 0:
+                    continue
+                print(f"  Δcnt={delta_c:+6d}  ΔGB={delta_b/1e9:+8.3f}  {tn}")
+
+        _OBJ_PREV_BY_LABEL[label] = (dict(by_type_count), dict(by_type_bytes), total_bytes)
+
+        if show_referrers_biggest and big_items:
+            target_id = big_items[0][3]
+            target = None
+            for o in gc.get_objects():
+                try:
+                    if id(o) == target_id:
+                        target = o
+                        break
+                except Exception:
+                    continue
+            if target is not None:
+                print(f"--- referrers of biggest non-tensor object ({type(target).__name__}, {big_items[0][0]/1e9:.3f} GB) ---")
+                for i, r in enumerate(gc.get_referrers(target)[:10]):
+                    try:
+                        rtype = type(r).__name__
+                        rlen = len(r) if hasattr(r, "__len__") else "-"
+                        preview = str(r)[:140].replace("\n", " ")
+                        print(f"  [{i}] {rtype}(len={rlen}): {preview}")
+                    except Exception as e:
+                        print(f"  [{i}] <repr-fail: {e}>")
+
+        return (trigger,)
+
+
 NODE_CLASS_MAPPINGS = {
     "WanVideoChunkWriter": WanVideoChunkWriter,
     "WanVideoChunkAssembler": WanVideoChunkAssembler,
@@ -632,6 +940,8 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoChunkSessionAuto": WanVideoChunkSessionAuto,
     "WanMemoryPurge": WanMemoryPurge,
     "WanVideoChunkLoader": WanVideoChunkLoader,
+    "WanTensorLeakProbe": WanTensorLeakProbe,
+    "WanObjectLeakProbe": WanObjectLeakProbe,
     "WanVideoChunkSaveAs": WanVideoChunkSaveAs,
     "WanVideoChunkCount": WanVideoChunkCount,
 }
@@ -645,4 +955,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoChunkLoader": "Wan Video Chunk Loader (disk -> IMAGE)",
     "WanVideoChunkSaveAs": "Wan Video Chunk Save-As (new session)",
     "WanVideoChunkCount": "Wan Video Chunk Count (session -> INT)",
+    "WanTensorLeakProbe": "Wan Tensor Leak Probe",
+    "WanObjectLeakProbe": "Wan Object Leak Probe (non-tensor)",
 }
