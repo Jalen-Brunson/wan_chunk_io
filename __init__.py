@@ -3,6 +3,19 @@ from . import cgroup_psutil_patch
 cgroup_psutil_patch.apply()
 
 from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
+from .colormatch_nodes import (
+    NODE_CLASS_MAPPINGS as _CM_CLASS,
+    NODE_DISPLAY_NAME_MAPPINGS as _CM_DISPLAY,
+)
+from .vace_overlap_strength import (
+    NODE_CLASS_MAPPINGS as _VS_CLASS,
+    NODE_DISPLAY_NAME_MAPPINGS as _VS_DISPLAY,
+)
+
+NODE_CLASS_MAPPINGS.update(_CM_CLASS)
+NODE_CLASS_MAPPINGS.update(_VS_CLASS)
+NODE_DISPLAY_NAME_MAPPINGS.update(_CM_DISPLAY)
+NODE_DISPLAY_NAME_MAPPINGS.update(_VS_DISPLAY)
 
 WEB_DIRECTORY = "./web"
 
