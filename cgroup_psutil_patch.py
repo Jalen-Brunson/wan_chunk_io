@@ -8,9 +8,14 @@ because host available never drops below THRESHOLD GB.
 
 This patch overrides psutil.virtual_memory() so:
     total     = cgroup memory.max
-    available = memory.max - memory.current
-    used      = memory.current
+    available = memory.max - (memory.current - inactive_file)
+    used      = memory.current - inactive_file
     percent   = 100 * used / total
+
+inactive_file (from memory.stat) is reclaimable page cache that the kernel
+frees on demand. Without subtracting it, "used" includes cached model files
+read from disk, making available appear much lower than reality (e.g. 21 GB
+reported vs 184 GB actual on Vast.ai with warm file caches).
 
 Other psutil fields are left at host defaults (rarely used by ComfyUI).
 """
@@ -55,18 +60,35 @@ _SVMEM = type(_SAMPLE)  # svmem namedtuple class
 _SVMEM_FIELDS = _SAMPLE._fields
 
 
+def _reclaimable_cache():
+    """Read inactive_file from cgroup memory.stat (reclaimable page cache)."""
+    stat_path = os.path.join(os.path.dirname(_USAGE_PATH), "memory.stat") if _USAGE_PATH else None
+    if stat_path is None:
+        return 0
+    try:
+        with open(stat_path) as f:
+            for line in f:
+                if line.startswith("inactive_file "):
+                    return int(line.split()[1])
+    except Exception:
+        pass
+    return 0
+
+
 def _cgroup_virtual_memory():
     used = _read(_USAGE_PATH) if _USAGE_PATH else None
     total = _read(_LIMIT_PATH) if _LIMIT_PATH else None
     if used is None or total is None or total <= 0 or total > (1 << 62):
         return _ORIG_VIRTUAL_MEMORY()
-    available = max(0, total - used)
-    percent = (used / total) * 100.0
+    reclaimable = _reclaimable_cache()
+    available = max(0, total - used + reclaimable)
+    effective_used = max(0, used - reclaimable)
+    percent = (effective_used / total) * 100.0
     host = _ORIG_VIRTUAL_MEMORY()
     kwargs = {name: getattr(host, name) for name in _SVMEM_FIELDS}
     kwargs["total"] = total
     kwargs["available"] = available
-    kwargs["used"] = used
+    kwargs["used"] = effective_used
     kwargs["free"] = available
     kwargs["percent"] = percent
     return _SVMEM(**kwargs)
